@@ -3,11 +3,17 @@ import torch.nn as nn
 import math
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(self, seq_len, dim_m) -> None:
+        super().__init__()
+        position = torch.arange(seq_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, dim_m, 2) * (-math.log(10000.0) / dim_m))
+        pe = torch.zeros(seq_len, dim_m)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
         
     def forward(self, xin):
-        pass
+        return xin + self.pe[:xin.size(1)]
     
 
 class DotProductAttention(nn.Module):
@@ -22,12 +28,13 @@ class DotProductAttention(nn.Module):
     def forward(self, q_in, k_in, v_in):
         q, k, v = self.w_q(q_in), self.w_k(k_in), self.w_v(v_in)
         qk = q.bmm(k.transpose(1,2))
-        dk_scale = math.sqrt(k.size(-1)) # k.size(-1) ** 0.5
+        dk_scale = k.size(-1) ** 0.5
 
         attn_aux = qk/dk_scale
         if self.masked:
-            mask = torch.tril(torch.ones(attn_aux.size()), diagonal=0) * 1e-9
-            attn_aux = attn_aux + mask
+            mask = torch.tril(torch.ones(attn_aux.size()), diagonal=0)
+            mask_inf = (mask*torch.triu(torch.ones(attn_aux.size()) * -1.0, diagonal=1))
+            attn_aux = attn_aux*mask + mask_inf
 
         attn = self.softmax(attn_aux)
         return attn.bmm(v)
@@ -132,13 +139,18 @@ class Transformer(nn.Module):
         return decoders_out
 
 class TransformerModel(nn.Module):
-  def __init__(self, n_encoders, n_decoders, n_heads, out_len, dim_m=512, dim_ff=2048, dropout=0.1):
+  def __init__(self, n_encoders, n_decoders, n_heads, in_len, out_len, feat_in, dim_m=512, dim_ff=2048, dropout=0.1):
         super().__init__()
+        self.pe = PositionalEncoding(seq_len=max(out_len+1, in_len), dim_m=dim_m)
+        self.enc_emb = nn.Linear(in_features=feat_in, out_features=dim_m)
+        self.dec_emb = nn.Linear(in_features=feat_in, out_features=dim_m)
         self.transformer = Transformer(n_encoders=n_encoders, n_decoders=n_decoders, n_heads=n_heads, dim_m=dim_m, dim_ff=dim_ff, dropout=dropout)
         self.lineal = nn.Linear(in_features=dim_m, out_features=1)
 
   def forward(self, src, target):
         # todo: autorregresive prediction
-        out = self.transformer(src, target)
+        src_emb = self.pe(self.enc_emb(src))
+        tgt_emb = self.pe(self.dec_emb(target))
+        out = self.transformer(src_emb, tgt_emb)
         out = self.lineal(out)
         return out
