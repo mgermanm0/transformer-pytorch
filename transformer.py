@@ -128,29 +128,27 @@ class DecoderModule(nn.Module):
         return temp
     
 class Transformer(nn.Module):
-    def __init__(self, n_encoders, n_decoders, n_heads, dim_m=512, dim_ff=2048, dropout=0.1) -> None:
+    def __init__(self, n_encoders, n_decoders, n_heads, in_len, out_len, feat_in_enc, feat_in_dec, dim_m=512, dim_ff=2048, dropout=0.1):
         super().__init__()
+        self.out_len = out_len
         self.encoders = EncoderModule(n_encoders=n_encoders, dim_m=dim_m, n_heads=n_heads, dim_ff=dim_ff, dropout=dropout)
         self.decoders = DecoderModule(n_decoders=n_decoders, dim_m=dim_m, n_heads=n_heads, dim_ff=dim_ff, dropout=dropout)
-
-    def forward(self, src, target):
-        encoders_out = self.encoders(src)
-        decoders_out = self.decoders(target, encoders_out)
-        return decoders_out
-
-class TransformerModel(nn.Module):
-  def __init__(self, n_encoders, n_decoders, n_heads, in_len, out_len, feat_in, dim_m=512, dim_ff=2048, dropout=0.1):
-        super().__init__()
         self.pe = PositionalEncoding(seq_len=max(out_len+1, in_len), dim_m=dim_m)
-        self.enc_emb = nn.Linear(in_features=feat_in, out_features=dim_m)
-        self.dec_emb = nn.Linear(in_features=feat_in, out_features=dim_m)
-        self.transformer = Transformer(n_encoders=n_encoders, n_decoders=n_decoders, n_heads=n_heads, dim_m=dim_m, dim_ff=dim_ff, dropout=dropout)
+        self.enc_emb = nn.Linear(in_features=feat_in_enc, out_features=dim_m)
+        self.dec_emb = nn.Linear(in_features=feat_in_dec, out_features=dim_m)
         self.lineal = nn.Linear(in_features=dim_m, out_features=1)
 
-  def forward(self, src, target):
+    def forward(self, src, target):
         # todo: autorregresive prediction
         src_emb = self.pe(self.enc_emb(src))
-        tgt_emb = self.pe(self.dec_emb(target))
-        out = self.transformer(src_emb, tgt_emb)
-        out = self.lineal(out)
-        return out
+        encoders_out = self.encoders(src_emb)
+
+        real_out = target
+        for i in range(self.out_len):
+          tgt_emb = self.pe(self.dec_emb(real_out))
+          decoders_out = self.decoders(tgt_emb, encoders_out)
+          out = self.lineal(decoders_out[:, -1, :])
+          out = out.unsqueeze(2)
+          real_out = torch.cat([real_out, out], dim=1)
+          
+        return real_out[:, 1:, :]
