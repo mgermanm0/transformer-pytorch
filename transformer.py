@@ -18,27 +18,28 @@ class DotProductAttention(nn.Module):
         self.w_v = nn.Linear(in_features=dim_m, out_features=dim_v)
         self.softmax = nn.Softmax(dim=-1)
         self.masked = masked
-    
+
     def forward(self, q_in, k_in, v_in):
         q, k, v = self.w_q(q_in), self.w_k(k_in), self.w_v(v_in)
         qk = q.bmm(k.transpose(1,2))
         dk_scale = math.sqrt(k.size(-1)) # k.size(-1) ** 0.5
-        
+
         attn_aux = qk/dk_scale
         if self.masked:
-            attn_aux = torch.tril(attn_aux, diagonal=0) #triangular inferior
-            
+            mask = torch.tril(torch.ones(attn_aux.size()), diagonal=0) * 1e-9
+            attn_aux = attn_aux + mask
+
         attn = self.softmax(attn_aux)
-        return attn.bmm(v)  
+        return attn.bmm(v)
     
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, n_heads=8, dim_m=512, dim_k=512, dim_q=512, dim_v=512, masked=False, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+        super().__init__()
         self.heads = nn.ModuleList([DotProductAttention(dim_m=dim_m, dim_k=dim_k, dim_q=dim_q,
-                                                        dim_v=dim_v, masked=masked) * n_heads])
+                                                        dim_v=dim_v, masked=masked) for _ in range(n_heads)])
         self.w_o = nn.Linear(in_features=n_heads*dim_v, out_features=dim_m)
-    
+
     def forward(self, q_in, k_in, v_in):
         concat = torch.concat([head(q_in, k_in, v_in) for head in self.heads], dim=-1)
         return self.w_o(concat)
@@ -51,41 +52,41 @@ class FeedForward(nn.Module):
         self.w_1 = nn.Linear(in_features=dim_m, out_features=dim_ff)
         self.w_2 = nn.Linear(in_features=dim_ff, out_features=dim_m)
         self.relu = nn.ReLU()
-    
+
     def forward(self, xin):
         return self.w_2(self.relu(self.w_1(xin)))
     
 class ResidualConnection(nn.Module):
-    def __init__(self, module, dropout=0.1) -> None:
+    def __init__(self, module, dim, dropout=0.1) -> None:
         super().__init__()
         self.module = module
-        self.layer_norm = nn.LayerNorm()
+        self.layer_norm = nn.LayerNorm(dim)
         self.dropout = nn.Dropout(dropout)
-    
-    def forward(self, xin):
+
+    def forward(self, xin, residx=0):
         out = self.dropout(self.module(*xin))
-        return self.layer_norm(xin[0] + out)
+        return self.layer_norm(xin[residx] + out)
     
     
 class EncoderLayer(nn.Module):
-    def __init__(self, dim_m=512, n_heads=6, dim_ff=2048, dropout=0.1) -> None:
+    def __init__(self, dim_m=512, n_heads=6, dim_ff=2048, dim_q=512, dim_k=512, dim_v=512, dropout=0.1) -> None:
         super().__init__()
-        self.attn = ResidualConnection(MultiHeadAttention(n_heads=n_heads), dropout=dropout)
-        self.ff = ResidualConnection(FeedForward(dim_m=dim_m, dim_ff=dim_ff), dropout=dropout)
-    
+        self.attn = ResidualConnection(MultiHeadAttention(n_heads=n_heads, dim_m=dim_m, dim_k=dim_k, dim_q=dim_q, dim_v=dim_v, masked=False), dim=dim_m, dropout=dropout)
+        self.ff = ResidualConnection(FeedForward(dim_m=dim_m, dim_ff=dim_ff), dim=dim_m, dropout=dropout)
+
     def forward(self, xin):
-        attn_out = self.attn(xin, xin, xin)
-        ff_out = self.ff(attn_out)
+        attn_out = self.attn([xin, xin, xin])
+        ff_out = self.ff([attn_out])
         return ff_out
 
 class EncoderModule(nn.Module):
     def __init__(self, n_encoders=6, dim_m=512, n_heads=6, dim_ff=2048, dropout=0.1) -> None:
         super().__init__()
-        dim_k = dim_q = dim_m / n_heads 
+        dim_k = dim_q = int(dim_m / n_heads)
         dim_v = dim_k
-        self.encoders = nn.ModuleList([EncoderLayer(dim_m=dim_m, n_heads=n_heads, dim_ff=dim_ff, 
-                                                    dim_q=dim_q, dim_k=dim_k, dim_v=dim_v, dropout=dropout) * n_encoders])
-    
+        self.encoders = nn.ModuleList([EncoderLayer(dim_m=dim_m, n_heads=n_heads, dim_ff=dim_ff,
+                                                    dim_q=dim_q, dim_k=dim_k, dim_v=dim_v, dropout=dropout) for _ in range(n_encoders)])
+
     def forward(self, xin):
         temp = xin
         for encoder in self.encoders:
@@ -93,25 +94,26 @@ class EncoderModule(nn.Module):
         return temp
     
 class DecoderLayer(nn.Module):
-    def __init__(self, dim_m=512, n_heads=6, dim_ff=2048, dropout=0.1) -> None:
-        self.masked_attn = ResidualConnection(MultiHeadAttention(n_heads=n_heads, masked=True), dropout=dropout)
-        self.attn = ResidualConnection(MultiHeadAttention(n_heads=n_heads), dropout=dropout)
-        self.ff = ResidualConnection(FeedForward(dim_m=dim_m, dim_ff=dim_ff), dropout=dropout)
+    def __init__(self, dim_m=512, n_heads=6, dim_ff=2048, dim_q=512, dim_k=512, dim_v=512, dropout=0.1) -> None:
+        super().__init__()
+        self.masked_attn = ResidualConnection(MultiHeadAttention(n_heads=n_heads, dim_m=dim_m, dim_k=dim_k, dim_q=dim_q, dim_v=dim_v, masked=True), dim=dim_m, dropout=dropout)
+        self.attn = ResidualConnection(MultiHeadAttention(n_heads=n_heads, dim_m=dim_m, dim_k=dim_k, dim_q=dim_q, dim_v=dim_v, masked=False), dim=dim_m, dropout=dropout)
+        self.ff = ResidualConnection(FeedForward(dim_m=dim_m, dim_ff=dim_ff), dim=dim_m, dropout=dropout)
         pass
-    
+
     def forward(self, xin, memory):
-        attn_masked_out = self.masked_attn(xin, xin, xin)
-        attn_out = self.attn(memory, memory, attn_masked_out)
-        return self.ff(attn_out)
+        attn_masked_out = self.masked_attn([xin, xin, xin])
+        attn_out = self.attn([attn_masked_out, memory, memory])
+        return self.ff([attn_out])
                 
 class DecoderModule(nn.Module):
     def __init__(self, n_decoders=6, dim_m=512, n_heads=6, dim_ff=2048, dropout=0.1) -> None:
         super().__init__()
-        dim_k = dim_q = dim_m / n_heads
+        dim_k = dim_q = int(dim_m / n_heads)
         dim_v = dim_k
-        self.decoders = nn.ModuleList([DecoderLayer(dim_m=dim_m, n_heads=n_heads, dim_ff=dim_ff, 
-                                                    dim_q=dim_q, dim_k=dim_k, dim_v=dim_v, dropout=dropout) * n_decoders])
-    
+        self.decoders = nn.ModuleList([DecoderLayer(dim_m=dim_m, n_heads=n_heads, dim_ff=dim_ff,
+                                                    dim_q=dim_q, dim_k=dim_k, dim_v=dim_v, dropout=dropout) for _ in range(n_decoders)])
+
     def forward(self, xin, memory):
         temp = xin
         for decoder in self.decoders:
@@ -119,13 +121,24 @@ class DecoderModule(nn.Module):
         return temp
     
 class Transformer(nn.Module):
-    def __init__(self, n_encoders, n_decoders, n_heads, dim_m, dim_ff, dropout) -> None:
+    def __init__(self, n_encoders, n_decoders, n_heads, dim_m=512, dim_ff=2048, dropout=0.1) -> None:
         super().__init__()
         self.encoders = EncoderModule(n_encoders=n_encoders, dim_m=dim_m, n_heads=n_heads, dim_ff=dim_ff, dropout=dropout)
         self.decoders = DecoderModule(n_decoders=n_decoders, dim_m=dim_m, n_heads=n_heads, dim_ff=dim_ff, dropout=dropout)
-    
-    def forward(self, xin):
-        encoders_out = self.encoders(xin)
-        decoders_out = self.decoders(xin, encoders_out)
-        
+
+    def forward(self, src, target):
+        encoders_out = self.encoders(src)
+        decoders_out = self.decoders(target, encoders_out)
         return decoders_out
+
+class TransformerModel(nn.Module):
+  def __init__(self, n_encoders, n_decoders, n_heads, out_len, dim_m=512, dim_ff=2048, dropout=0.1):
+        super().__init__()
+        self.transformer = Transformer(n_encoders=n_encoders, n_decoders=n_decoders, n_heads=n_heads, dim_m=dim_m, dim_ff=dim_ff, dropout=dropout)
+        self.lineal = nn.Linear(in_features=dim_m, out_features=1)
+
+  def forward(self, src, target):
+        # todo: autorregresive prediction
+        out = self.transformer(src, target)
+        out = self.lineal(out)
+        return out
